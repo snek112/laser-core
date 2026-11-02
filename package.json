@@ -55,6 +55,7 @@
       "explorer-publisher.js",
       "ipc-validation.js",
       "mining-preferences.js",
+      "mining-gate.js",
       "wallet-secret-store.js",
       "wallet-files.js",
       "renderer/**/*",

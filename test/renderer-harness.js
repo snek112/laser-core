@@ -2,18 +2,21 @@
 const fs=require('node:fs');
 const path=require('node:path');
 const vm=require('node:vm');
+const {miningGate}=require('../mining-gate');
 const root=path.resolve(__dirname,'..');
+const TIP='ab'.repeat(32), DEFAULT_INTENSITY=25;
 function setup(bridge={},stored={}) {
   const storage=new Map(Object.entries(stored));
   const calls=[];
-  let mine={mining:false,wallet:null,backend:'cpu',cuda_available:false,cpu_fallback:true,session:{blocks:0,errors:0,started_at:null}};
+  const chain={network:'shadow',height:12,tip:TIP,blocks:13,mempool:0,orphans:0,peers:2,target_spacing_seconds:10,peer_best_height:12,peer_best_tip:TIP};
+  let mine={mining:false,wallet:null,backend:'cpu',cuda_available:false,cpu_fallback:true,intensity:DEFAULT_INTENSITY,session:{blocks:0,errors:0,started_at:null}};
   const wallets=new Map([['Alice',{name:'Alice',address:'a1'.repeat(32),balance_photons:'9007199254740993',nonce:0}],['Bob',{name:'Bob',address:'b2'.repeat(32),balance_photons:'20000000000',nonce:0}]]);
   const unlocked=new Set();
   const listeners={};
   const metrics=n=>({wallet:n,confirmed_photons:wallets.get(n).balance_photons,pending_spent_photons:'0',pending_received_photons:'0',projected_photons:wallets.get(n).balance_photons,blocks_mined:0,total_mined_photons:'0',subsidy_photons:'0',fee_photons:'0',has_last:false,next_reward_photons:'7527996698'});
   const laser={
     startup:async()=>({ready:true,appVersion:'0.2.0-beta.1',channel:'v3'}),
-    status:async()=>({height:12,blocks:13,mempool:0,orphans:0}),
+    status:async()=>{const st={...chain,median_time_past:Math.floor(Date.now()/1000)-30};return {...st,mining_gate:miningGate(st)};},
     peers:async()=>({peers:2,outbound:2,inbound:0,connecting:0}),
     config:async()=>({channel:'v3',network:'shadow',walletDir:'test/wallets'}),
     publisherStatus:async()=>({state:'unconfigured',enabled:false,url:''}),
@@ -25,10 +28,10 @@ function setup(bridge={},stored={}) {
     walletRestore:async n=>{wallets.set(n,{name:n,address:'d4'.repeat(32),balance_photons:'0'});return {name:n};},
     walletLock:async n=>{calls.push(['walletLock',n]);unlocked.delete(n);mine={...mine,mining:false};return true;},
     minerMetrics:async n=>metrics(n),mineStatus:async()=>mine,
-    mineStart:async(n,interval,intensity=100)=>{calls.push(['mineStart',n,interval,intensity]);mine={...mine,mining:true,wallet:n,interval,intensity};return mine;},
+    mineStart:async(n,interval,intensity=DEFAULT_INTENSITY,solo=false)=>{calls.push(['mineStart',n,interval,intensity,solo]);mine={...mine,mining:true,wallet:n,interval,intensity};return mine;},
     mineSetIntensity:async intensity=>{calls.push(['mineSetIntensity',intensity]);mine={...mine,intensity};return mine;},
     mineStop:async()=>{calls.push(['mineStop']);mine={...mine,mining:false};return mine;},
-    mine:async(n,count,intensity=100)=>{calls.push(['mine',n,count,intensity]);return 'Mined '+count+' blocks';},
+    mine:async(n,count,intensity=DEFAULT_INTENSITY,solo=false)=>{calls.push(['mine',n,count,intensity,solo]);return 'Mined '+count+' blocks';},
     send:async(...args)=>{calls.push(['send',...args]);return 'Accepted by node';},
     copyAddress:async a=>{calls.push(['copyAddress',a]);return true;},
     onBlockMined:cb=>{listeners.block=cb;return ()=>delete listeners.block;},
@@ -41,6 +44,6 @@ function setup(bridge={},stored={}) {
   vm.runInNewContext(fs.readFileSync(path.join(root,'renderer/app.js'),'utf8'),context);
   const app=new context.module.exports.Component();
   app.m=laser;app.walletEpoch={};app.localBlocks=0;
-  return {app,laser,calls,unlocked,wallets,metrics,storage,listeners,...context.module.exports};
+  return {app,laser,calls,unlocked,wallets,metrics,storage,listeners,chain,tip:TIP,...context.module.exports};
 }
-module.exports={setup};
+module.exports={setup,TIP,DEFAULT_INTENSITY};

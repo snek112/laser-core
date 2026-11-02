@@ -6,6 +6,7 @@ const FEES = [['0.05', 'Priority'], ['0.02', 'High'], ['0.01', 'Standard'], ['0.
 const SPECTRUM = ['#6a2cf0', '#2a5cf5', '#0a84c8', '#00897d', '#3f9a2e', '#c4237f'];
 
 const CKEY = 'laser-core.contacts.v1', PREFS_KEY = 'laser-core.preferences.v1';
+const INTENSITIES = [10, 25, 50, 75, 100], DEFAULT_INTENSITY = 25;
 
 function parseLaser(v) {
   const s = String(v == null ? '' : v).trim();
@@ -37,14 +38,16 @@ class Component extends React.Component {
     return {
       phase: 'main', view: 'overview', vw: window.innerWidth, vh: window.innerHeight, now: Date.now(),
       splash: { text: '', progress: 0, log: [], error: false, detail: '', slow: false, final: false, t0: Date.now() },
-      node: { online: null, status: null, peers: null, err: null, lastOk: null, startup: null },
+      node: { online: null, waiting: false, status: null, peers: null, err: null, lastOk: null, startup: null },
       wallets: [], selected: '', unlocked: {}, records: {}, metricsByWallet: {}, metrics: null, metricsErr: null, metricsAt: null, walletErr: null,
       mining: null, solves: [], activity: [], dlg: null, toast: null,
       intensity: this.savedIntensity(), intensityBusy: false,
       publisher: null, publisherDraft: null, publisherBusy: false, publisherError: null,
       send: { to: '', label: '', from: '', amount: '', subtract: false, fee: '0.01', feeCustom: '', touched: {} },
       contacts: this.loadContacts(), copiedAt: 0,
-      mineErr: null, mineBusy: false, mineWallet: '', intervalStr: '10', onceStr: '1', onceBusy: false, onceMsg: null, cfg: null, showDetail: false
+      mineErr: null, mineBusy: false, mineWallet: '', intervalStr: '10', onceStr: '1', onceBusy: false, onceMsg: null, cfg: null, showDetail: false,
+      // Deliberately not persisted: the override has to be re-armed each run.
+      soloOverride: false
     };
   }
   loadContacts() {
@@ -52,7 +55,7 @@ class Component extends React.Component {
   }
   saveContacts(list) { try { localStorage.setItem(CKEY,JSON.stringify(Object.fromEntries(list.map(x=>[x.address,x.label])))); } catch (_) {} }
   preferences() { try { return JSON.parse(localStorage.getItem(PREFS_KEY)||'{}') || {}; } catch (_) { return {}; } }
-  savedIntensity() { const n=this.preferences().miningIntensity;return [10,25,50,75,100].includes(n)?n:100; }
+  savedIntensity() { const n=this.preferences().miningIntensity;return INTENSITIES.includes(n)?n:DEFAULT_INTENSITY; }
   savePreference(patch) { try { localStorage.setItem(PREFS_KEY,JSON.stringify({...this.preferences(),...patch})); } catch (_) {} }
   update(patch) { return new Promise(resolve=>this.setState(patch,resolve)); }
   showDialog(dlg) { this.returnFocus=document.activeElement; this.setState({dlg}); }
@@ -257,16 +260,28 @@ class Component extends React.Component {
     });
   }
 
+  // The node answers RPC on a single thread and every call is a fresh
+  // laser.exe, so a poll asks for status on its own and spends further calls
+  // only when the node answered and when the chain or wallet set moved.
+  chainMoved(status) {
+    const unlocked = Object.keys(this.state.unlocked).filter(n => this.state.unlocked[n]).join(',');
+    const mark = `${status.height}/${status.mempool}/${unlocked}`;
+    if (this.chainMark === mark) return false;
+    this.chainMark = mark; return true;
+  }
+
   async poll() {
     const m = this.m;
     if (this.polling) return; this.polling = true;
+    this.polls = (this.polls || 0) + 1;
     try {
-      let status = null, peers = null, err = null;
-      const results=await Promise.allSettled([m.status(),m.peers()]);
-      if(results[0].status==='fulfilled') status=results[0].value; else err=results[0].reason.message;
-      if(results[1].status==='fulfilled') peers=results[1].value;
+      let status = null, err = null;
+      try { status = await m.status(); } catch (e) { err = e.message; }
       let startup = null;
       try { startup = await m.startup(); } catch (_) { }
+      const waiting = !status && startup?.rpc?.kind === 'busy';
+      let peers = this.state.node.peers;
+      if (status && this.polls % 2 === 1) { try { peers = await m.peers(); } catch (_) { peers = null; } }
       try { await this.refreshWallets(); } catch(e) { this.setState({walletErr:e.message}); }
       if (m !== this.m || this.destroyed) return;
       const local = this.localBlocks; this.localBlocks = 0;
@@ -274,7 +289,8 @@ class Component extends React.Component {
         const node = { ...s.node }; const act = s.activity.slice();
         if (startup) node.startup = startup;
         if (status) {
-          if (node.online === false && node.lastOk) act.unshift(this.ev('ok', 'Reconnected to the local node'));
+          if (node.waiting) act.unshift(this.ev('ok', 'The local node is answering again'));
+          else if (node.online === false && node.lastOk) act.unshift(this.ev('ok', 'Reconnected to the local node'));
           const prev = node.status ? node.status.height : null;
           if (prev !== null && status.height > prev) {
             const other = status.height - prev - local;
@@ -283,17 +299,24 @@ class Component extends React.Component {
               else act.unshift({ ...this.ev('chain', `Chain advanced to #${grp(status.height)}`, `+${other} block${other > 1 ? 's' : ''} · not mined by this app`), n: other });
             }
           }
-          Object.assign(node, { online: true, status, peers, err: null, lastOk: Date.now() });
+          Object.assign(node, { online: true, waiting: false, status, peers, err: null, lastOk: Date.now() });
+        } else if (waiting) {
+          // A missed RPC deadline is a busy node, not a stopped one. This list
+          // is the only diagnostic record the portable build keeps, so it must
+          // not claim the node went away.
+          if (!node.waiting) act.unshift(this.ev('warn', 'The local node is busy and did not answer in time', err));
+          Object.assign(node, { waiting: true, err });
         } else {
           if (node.online !== false && node.lastOk) act.unshift(this.ev('err', 'Lost connection to the local node', err));
-          Object.assign(node, { online: false, err });
+          Object.assign(node, { online: false, waiting: false, err });
         }
-        return { node, activity: act.slice(0, 60), metrics:status?s.metrics:null, metricsByWallet:status?s.metricsByWallet:{} };
+        const held = !!status || waiting;
+        return { node, activity: act.slice(0, 60), metrics:held?s.metrics:null, metricsByWallet:held?s.metricsByWallet:{} };
       });
       try { const st = await m.mineStatus(); if (m === this.m) this.setState({ mining: st }); } catch (e) { }
       try { const publisher = await m.publisherStatus(); if (m === this.m) this.setState({ publisher }); }
       catch (_) { this.setState({ publisher: { state: 'unavailable', error: 'Publisher status is unavailable.' } }); }
-      await this.refreshSelected();
+      if (status && this.chainMoved(status)) await this.refreshSelected();
     } finally { this.polling = false; }
   }
 
@@ -462,6 +485,43 @@ class Component extends React.Component {
     finally {this.intensityAction=false;this.setState({intensityBusy:false});}
   }
 
+  // The mining gate itself lives in mining-gate.js and runs in the main
+  // process, which puts its verdict on the status reply as mining_gate and
+  // re-checks it before any mining command. This reads that verdict, applies
+  // the session's solo override and words it.
+  miningReadiness() {
+    const N = this.state.node, g = N.status && N.status.mining_gate;
+    const solo = this.state.soloOverride === true;
+    if (N.online !== true || !g) return { ok: false, blockedBy: 'chain-unreadable', solo, overridable: false, peers: null, tipAge: null,
+      short: 'Chain state unknown',
+      reason: 'Laser Core cannot read the chain state from the local node, so it cannot tell whether a mined block would build on the current tip.' };
+    const tipAge = g.tip_age_seconds === null ? null : hms(g.tip_age_seconds * 1000);
+    const blocked = {
+      peers: 'The node has no established peers, so it cannot know which chain the network is on. Blocks mined now would extend a private chain that Shadownet discards.',
+      'peer-chain-unknown': `The node reports its own tip, #${grp(g.local_height)} ${short(g.local_tip || '')}, but not the best height and tip hash its peers announce, so Laser Core cannot confirm that tip is the network’s.${tipAge ? ` The tip is ${tipAge} old.` : ''}`,
+      height: `The node is ${grp(g.blocks_behind)} block${g.blocks_behind === 1 ? '' : 's'} behind its peers: local height #${grp(g.local_height)} against #${grp(g.peer_best_height)} reported by peers. A block mined now would be orphaned.`,
+      tip: `The node is at the same height as its peers, #${grp(g.local_height)}, but on a different chain: local tip ${short(g.local_tip || '')} against ${short(g.peer_best_tip || '')}. A block mined now would be orphaned.`,
+      'chain-unreadable': 'The node did not report a readable chain tip, so Laser Core cannot tell which chain a mined block would extend.'
+    }[g.blocked_by] || '';
+    const ok = g.ok === true || (solo && g.overridable === true);
+    const short_ = { peers: 'Waiting for peers', 'peer-chain-unknown': 'Cannot confirm the network tip',
+      height: 'Waiting for the chain to catch up', tip: 'Local chain disagrees with its peers',
+      'chain-unreadable': 'Chain state unknown' }[g.blocked_by] || 'Ready to mine';
+    return {
+      ok, blockedBy: g.blocked_by, overridable: g.overridable === true, solo,
+      regtest: g.regtest_exempt === true, peers: g.peers, peerChainKnown: g.peer_chain_known === true,
+      tipMatches: g.tip_matches, tipAge: g.tip_age_seconds, tipFresh: g.tip_fresh, behind: g.blocks_behind,
+      short: ok && solo && g.ok !== true ? 'Mining with the solo override' : ok ? 'Ready to mine' : short_,
+      reason: ok && solo && g.ok !== true
+        ? `Solo mining override is on, so Laser Core is not checking agreement with the network. ${blocked}`
+        : blocked
+    };
+  }
+
+  toggleSolo() {
+    this.setState(s => ({ soloOverride: !s.soloOverride, mineErr: null, onceMsg: null }));
+  }
+
   async mineToggle() {
     const s = this.state; if (s.mineBusy || s.onceBusy || s.intensityBusy || this.miningAction) return;
     this.miningAction=true;
@@ -477,9 +537,12 @@ class Component extends React.Component {
         if (!Number.isInteger(iv) || iv < 1 || iv > 120) throw new Error('Set the interval to a whole number from 1 to 120 seconds.');
         const w = s.mineWallet;
         if(!s.node.online || !s.unlocked[w])throw new Error('Connect the node and unlock the mining wallet first.');
-        const st = await this.m.mineStart(w, iv * 1000, s.intensity);
+        const ready = this.miningReadiness();
+        if (!ready.ok) throw new Error(ready.reason);
+        const st = await this.m.mineStart(w, iv * 1000, s.intensity, s.soloOverride);
         this.setState({ mining: st, solves: s.mining && s.mining.wallet === w ? s.solves : [] });
         this.log('mined', `Started continuous mining with ${w}`, `${s.intensity}% intensity · every ${iv} s`);
+        if (ready.solo && ready.blockedBy !== 'none') this.log('warn', 'Solo mining override is on', ready.reason);
       }
     } catch (x) { this.setState({ mineErr: x.message }); }
     finally { this.miningAction=false;this.setState({ mineBusy: false }); }
@@ -496,14 +559,17 @@ class Component extends React.Component {
     const s = this.state, n = Number(s.onceStr);
     if(this.onceAction || this.miningAction || s.intensityBusy || s.mining?.mining || !s.node.online || !s.unlocked[s.mineWallet])return;
     if (!Number.isInteger(n) || n < 1 || n > 100) { this.setState({ onceMsg: { err: true, text: 'Choose a whole number of blocks from 1 to 100.' } }); return; }
+    const ready = this.miningReadiness();
+    if (!ready.ok) { this.setState({ onceMsg: { err: true, text: ready.reason } }); return; }
     this.onceAction=true;
     this.setState({ onceBusy: true, onceMsg: null });
     try {
-      const out = await this.m.mine(s.mineWallet, n, s.intensity);
+      const out = await this.m.mine(s.mineWallet, n, s.intensity, s.soloOverride);
       this.localBlocks += n;
       const st = await this.m.mineStatus();
       this.setState({ mining: st, onceMsg: { err: false, text: out } });
       this.log('mined', `Mined ${n} block${n > 1 ? 's' : ''} with ${s.mineWallet}`, 'one-shot');
+      if (ready.solo && ready.blockedBy !== 'none') this.log('warn', 'Solo mining override is on', ready.reason);
       this.refreshSelected();
     } catch (x) { this.setState({ onceMsg: { err: true, text: x.message } }); }
     finally { this.onceAction=false;this.setState({ onceBusy: false }); }
@@ -520,7 +586,12 @@ class Component extends React.Component {
     const winW = fixed ? fixed[0] : s.vw, winH = fixed ? fixed[1] : s.vh;
     const compact = winW < 900, sbW = compact ? 76 : 200, cw = winW - sbW;
     const two = cw >= 700;
-    const online = N.online === true, offline = N.online === false, stale = offline && !!N.lastOk;
+    const online = N.online === true, offline = N.online === false;
+    // A missed RPC deadline leaves a live node that is simply behind on its
+    // replies. Its last readings are stale, but it is not offline.
+    const waiting = online && !!N.waiting, stale = (offline || waiting) && !!N.lastOk;
+    const nodeState = waiting ? 'Online · busy' : online ? 'Online · RPC ready' : offline ? 'Offline' : 'Connecting…';
+    const nodeStateColor = waiting ? WARN : online ? OK : offline ? ERR : SUB;
     const nv = online ? INK : FAINT;
     const sel = s.selected, selUnl = !!s.unlocked[sel], rec = s.records[sel];
     const met = selUnl && s.metrics && s.metrics.wallet === sel ? s.metrics : null;
@@ -528,6 +599,7 @@ class Component extends React.Component {
     const backendLabel = b => b === 'cuda' ? 'NVIDIA CUDA' : b === 'cpu' ? 'CPU' : (b || 'Detecting…');
     const obsState = st && st.shadow ? st.shadow.state : (N.startup && N.startup.shadow ? N.startup.shadow.state : null);
     const obs = { v: !online ? 'Unknown while node is offline' : obsState === 'active' ? 'Running' : obsState === 'paused' ? 'Paused · low intensity' : obsState ? 'Stopped' : 'Not reported', vc: online && obsState === 'active' ? OK : SUB };
+    const ready = this.miningReadiness();
     const self = this;
 
     // splash
@@ -562,7 +634,7 @@ class Component extends React.Component {
       send: 'Shadownet test LASER',
       receive: sel ? sel : 'No wallet',
       mining: mining ? `Mining with ${ms.wallet}` : 'Idle',
-      network: online ? `Height #${grp(st.height)}` : 'Node offline'
+      network: online ? `Height #${grp(st.height)}` : offline ? 'Node offline' : 'Connecting'
     }[s.view];
     const head = { num: String(vIdx + 1).padStart(2, '0'), label: VIEWS[vIdx][1], color: VIEWS[vIdx][2], sub: headSub };
 
@@ -573,6 +645,8 @@ class Component extends React.Component {
     if (starting) banner = { show: true, bg: '#fbf3e6', border: '#ecd4b0', fg: WARN, label: 'Node starting', text: 'The node is loading and verifying your saved chain. This can take several minutes. Keep Laser Core open; it will connect automatically when ready.' + (N.startup.startedAt ? ` Elapsed: ${hms(s.now - N.startup.startedAt)}.` : ''), hasDetail: false };
     else if (offline && se && !N.lastOk) banner = { show: true, bg: '#fbeef0', border: '#efc6cf', fg: ERR, label: 'Node failed to start', text: se, hasDetail: !!(N.startup.stderr?.length || N.err), detail: [Array.isArray(N.startup.stderr) ? N.startup.stderr.join('\n') : N.startup.stderr, N.err].filter(Boolean).join('\n') };
     else if (offline) banner = { show: true, bg: '#fbeef0', border: '#efc6cf', fg: ERR, label: stale ? 'Reconnecting' : 'Node offline', text: stale ? `The local node stopped answering. Grey values were last updated at ${clock(N.lastOk)}. Retrying every 2 s.` : 'Waiting for the local RPC interface. Wallet balances and mining need the node.', hasDetail: !!N.err, detail: N.err || '' };
+    else if (waiting) banner = { show: true, bg: '#fbf3e6', border: '#ecd4b0', fg: WARN, label: 'Node busy', text: `The local node is running and listening, but did not answer the status request in time. That is normal while it catches up, and Laser Core keeps asking. The values shown were last read at ${clock(N.lastOk)}.`, hasDetail: !!N.err, detail: N.err || '' };
+    else if (online && !ready.ok && ready.blockedBy !== 'chain-unreadable') banner = { show: true, bg: '#fbf3e6', border: '#ecd4b0', fg: WARN, label: 'Mining blocked', text: `${ready.reason} Wallets, balances and sending are unaffected.`, hasDetail: false };
     else if (online && pe && pe.peers === 0) banner = { show: true, bg: '#fbf3e6', border: '#ecd4b0', fg: WARN, label: 'No peers', text: `The local node is running but not connected to other Shadownet nodes${pe.connecting ? ` · ${pe.connecting} connection attempts in progress` : ''}.`, hasDetail: false };
     else if (N.online === null && s.phase === 'main') banner = { show: true, bg: '#f4f4f1', border: '#e6e5e0', fg: SUB, label: 'Connecting', text: 'Contacting the local node…', hasDetail: false };
     if(s.walletErr && !banner.show)banner={show:true,bg:'#fbf3e6',border:'#ecd4b0',fg:WARN,label:'Wallet list unavailable',text:s.walletErr,hasDetail:false};
@@ -593,9 +667,9 @@ class Component extends React.Component {
     const bal = {
       none: balState === 'none', locked: balState === 'locked', loading: balState === 'loading', open: balState === 'open', stale,
       color: stale ? FAINT : INK, avail: amt(conf),
-      availSub: stale ? `Last known at ${clock(N.lastOk)} · node offline` : conf==null ? 'Balance unavailable from the node' : 'Confirmed on the active chain',
+      availSub: stale ? `Last known at ${clock(N.lastOk)} · node ${waiting ? 'busy' : 'offline'}` : conf==null ? 'Balance unavailable from the node' : 'Confirmed on the active chain',
       pendKnown, pendUnknown: !pendKnown, pend: amt(pd, true), pendColor: pd === null || pd === 0n ? INK : pd > 0n ? OK : INK,
-      pendSub: met ? `+${laser(met.pending_received_photons)} in · −${laser(met.pending_spent_photons)} out` : (stale ? 'Unknown while the node is offline' : s.metricsErr ? 'This node did not report mempool effects' : 'Waiting for node metrics'),
+      pendSub: met ? `+${laser(met.pending_received_photons)} in · −${laser(met.pending_spent_photons)} out` : (stale ? `Unknown while the node is ${waiting ? 'busy' : 'offline'}` : s.metricsErr ? 'This node did not report mempool effects' : 'Waiting for node metrics'),
       proj: amt(met ? met.projected_photons : null),
       addr: rec ? short(rec.address) : '', addrFull: rec ? rec.address : '', nonce: rec ? rec.nonce : '—',
       updated: N.lastOk ? `Updated ${clock(N.lastOk)}` : ''
@@ -604,7 +678,7 @@ class Component extends React.Component {
     const copyLabel = copied ? 'Copied ✓' : 'Copy';
 
     const ovNode = [
-      { k: 'State', v: online ? 'Online · RPC ready' : offline ? 'Offline' : 'Connecting…', vc: online ? OK : offline ? ERR : SUB },
+      { k: 'State', v: nodeState, vc: nodeStateColor },
       { k: 'Height', v: st ? '#' + grp(st.height) : '—', vc: nv },
       { k: 'Peers', v: pe ? `${pe.peers} established` : '—', vc: pe && pe.peers === 0 && online ? WARN : nv },
       { k: 'Mempool', v: st ? `${st.mempool} tx` : '—', vc: nv },
@@ -617,8 +691,8 @@ class Component extends React.Component {
       { k: 'Backend', v: ms ? backendLabel(ms.backend) + (ms.backend === 'cuda' ? ' + CPU check' : '') : 'Detecting…', vc: INK },
       { k: 'Session blocks', v: sess && sess.started_at ? grp(sess.blocks) : '—', vc: INK }
     ];
-    const kindColor = { wallet: '#6a2cf0', mined: '#2a5cf5', chain: '#c9c8c1', send: '#c4237f', ok: OK, err: ERR };
-    const activity = s.activity.slice(0, compact ? 8 : 12).map(a => ({ time: clock(a.t), text: a.text, detail: a.detail, dot: kindColor[a.kind] || SUB, fg: a.kind === 'err' ? ERR : a.kind === 'chain' ? SUB : INK }));
+    const kindColor = { wallet: '#6a2cf0', mined: '#2a5cf5', chain: '#c9c8c1', send: '#c4237f', ok: OK, warn: WARN, err: ERR };
+    const activity = s.activity.slice(0, compact ? 8 : 12).map(a => ({ time: clock(a.t), text: a.text, detail: a.detail, dot: kindColor[a.kind] || SUB, fg: a.kind === 'err' ? ERR : a.kind === 'warn' ? WARN : a.kind === 'chain' ? SUB : INK }));
 
     // send
     const c = this.sendCalc(), t = s.send.touched;
@@ -663,12 +737,29 @@ class Component extends React.Component {
     // mining
     const mw = s.mineWallet, mwUnl = !!s.unlocked[mw];
     const ivN = Number(s.intervalStr), ivOk = Number.isInteger(ivN) && ivN >= 1 && ivN <= 120;
-    const canStart = online && mwUnl && ivOk && !!mw;
+    const canStart = online && mwUnl && ivOk && !!mw && ready.ok;
     const prereq = [
-      { ok: online, text: online ? 'Node online' : 'Node offline' },
+      { ok: online && !waiting, warn: waiting, text: waiting ? 'Node busy' : online ? 'Node online' : 'Node offline' },
       { ok: mwUnl, text: !mw ? 'No wallet' : mwUnl ? `${mw} unlocked` : `${mw} is locked` },
-      { ok: !!(pe && pe.peers > 0), warn: true, text: pe ? `${pe.peers} peer${pe.peers === 1 ? '' : 's'}` : 'Peers unknown' }
-    ].map(p => ({ text: p.text, mark: p.ok ? '✓' : p.warn ? '!' : '✕', fg: p.ok ? OK : p.warn ? WARN : ERR }));
+      { ok: ready.peers !== null && ready.peers > 0, text: ready.peers === null ? 'Peers unknown' : `${grp(ready.peers)} peer${ready.peers === 1 ? '' : 's'}` },
+      ready.regtest
+        ? { ok: true, text: 'Regtest · agreement not required' }
+        : { ok: ready.tipMatches === true, warn: !ready.peerChainKnown,
+            text: ready.tipMatches === true ? 'Tip matches its peers'
+              : !ready.peerChainKnown ? 'Peer chain not reported'
+              : ready.blockedBy === 'height' ? `Behind by ${grp(ready.behind)}`
+              : 'Tip differs from its peers' },
+      { ok: false, warn: true, hide: !ready.solo, text: 'Solo override on' }
+    ].filter(p => !p.hide).map(p => ({ text: p.text, mark: p.ok ? '✓' : p.warn ? '!' : '✕', fg: p.ok ? OK : p.warn ? WARN : ERR }));
+    const solo = {
+      on: ready.solo, disabled: mining || s.mineBusy || s.onceBusy,
+      label: 'Mine without confirming agreement with the network (solo mining)',
+      fg: ready.solo ? WARN : SUB,
+      help: ready.solo
+        ? 'Laser Core will not check the local tip against the chain its peers report. Use this only for the first node of a new network. It resets when Laser Core restarts.'
+        : 'Leave this off for Shadownet. It exists for the first node of a new network, which has no peers to agree with yet.',
+      toggle: () => this.toggleSolo()
+    };
     const sessActive = sess && sess.started_at && ms.wallet === mw;
     const mc = {
       intensity: s.intensity,
@@ -681,9 +772,9 @@ class Component extends React.Component {
       btnLabel: s.mineBusy ? (mining ? 'Stopping…' : 'Starting…') : mining ? 'Stop mining' : 'Start mining',
       btnDisabled: s.mineBusy || s.onceBusy || s.intensityBusy || (!mining && !canStart),
       btnBg: mining ? '#ffffff' : INK, btnFg: mining ? INK : '#ffffff', btnBorder: mining ? INK : INK, btnDot: mining ? ERR : '#2a5cf5',
-      title: mining ? `Mining continuously with ${ms.wallet}` : !online ? 'Mining needs the local node' : !mw ? 'Create a wallet to mine' : !mwUnl ? `Unlock ${mw} to mine` : 'Ready to mine',
-      titleFg: mining ? '#2a5cf5' : INK,
-      sub: mining ? (nextIn === null ? 'Cycle in progress' : `Next cycle in ${nextIn} s`) + ` · every ${Math.round(ms.interval / 1000)} s` : !mwUnl && mw ? 'Opening a wallet never starts mining by itself.' : `PhotonHash v0.2 · ${ms ? backendLabel(ms.backend) : 'backend detecting'}`,
+      title: mining ? `Mining continuously with ${ms.wallet}` : !online ? 'Mining needs the local node' : !mw ? 'Create a wallet to mine' : !mwUnl ? `Unlock ${mw} to mine` : ready.short,
+      titleFg: mining ? '#2a5cf5' : online && ready.reason ? WARN : INK,
+      sub: mining ? (nextIn === null ? 'Cycle in progress' : `Next cycle in ${nextIn} s`) + ` · every ${Math.round(ms.interval / 1000)} s` : !mwUnl && mw ? 'Opening a wallet never starts mining by itself.' : ready.reason || `PhotonHash v0.2 · ${ms ? backendLabel(ms.backend) : 'backend detecting'}`,
       hasErr: !!s.mineErr,
       sessSub: sessActive ? `${ms.wallet} · since ${clock(sess.started_at)}` : 'No session yet',
       lifeSub: met ? `${sel} · from node metrics` : (selUnl ? 'Not reported' : 'Unlock a wallet')
@@ -728,13 +819,14 @@ class Component extends React.Component {
       disabled: mining || s.mineBusy || s.onceBusy, border: onceOk ? '#d6d5cf' : ERR,
       btnDisabled: mining || s.mineBusy || s.onceBusy || s.intensityBusy || !onceOk || !canStart,
       label: s.onceBusy ? 'Mining…' : `Mine ${onceOk ? onceN : ''} block${onceN === 1 ? '' : 's'}`,
-      help: mining ? 'Unavailable while continuous mining runs.' : 'Mines a fixed number of blocks (1–100) with the mining wallet, without starting continuous mining.',
+      help: mining ? 'Unavailable while continuous mining runs.' : ready.reason || 'Mines a fixed number of blocks (1–100) with the mining wallet, without starting continuous mining.',
       hasMsg: !!s.onceMsg, msg: s.onceMsg ? s.onceMsg.text : '', msgColor: s.onceMsg && s.onceMsg.err ? ERR : OK
     };
 
     // network
     let net;
-    if (!online) net = { fg: N.online === null ? SUB : ERR, kicker: N.online === null ? 'Connecting' : 'Offline', title: N.online === null ? 'Contacting the local node' : se && !N.lastOk ? 'The local node did not start' : 'The local node is not answering', sub: N.online === null ? '' : stale ? `Last successful response at ${clock(N.lastOk)}. Laser Core keeps retrying.` : 'Peer and chain information is unavailable until the RPC interface responds.' };
+    if (!online) net = { fg: N.online === null ? SUB : ERR, kicker: N.online === null ? 'Connecting' : 'Offline', title: N.online === null ? 'Contacting the local node' : se && !N.lastOk ? 'The local node did not start' : 'The local node cannot be reached', sub: N.online === null ? '' : stale ? `Last successful response at ${clock(N.lastOk)}. Laser Core keeps retrying.` : 'Peer and chain information is unavailable until the RPC interface responds.' };
+    else if (waiting) net = { fg: WARN, kicker: 'Busy', title: 'The local node is running but behind on its replies', sub: `The status request passed its deadline without an answer. Readings below were last updated at ${clock(N.lastOk)}.` };
     else if (pe && pe.peers === 0) net = { fg: WARN, kicker: 'No peers', title: 'Running locally, not connected to Shadownet', sub: `${pe.connecting} connection attempt${pe.connecting === 1 ? '' : 's'} in progress · ${pe.known} known address${pe.known === 1 ? '' : 'es'} · discovery ${pe.discovery ? 'on' : 'off'}` };
     else if(!pe) net={fg:WARN,kicker:'Peers unavailable',title:'Local node ready',sub:'The node answered, but peer diagnostics could not be read.'};
     else net = { fg: OK, kicker: 'Connected', title: `Connected to ${pe.peers} Shadownet peer${pe.peers === 1 ? '' : 's'}`, sub: `${pe.outbound} outbound · ${pe.inbound} inbound · ${pe.connecting} connecting · local RPC ready` };
@@ -743,9 +835,11 @@ class Component extends React.Component {
     const pv = k => pe ? (typeof pe[k] === 'boolean' ? (pe[k] ? 'On' : 'Off') : grp(pe[k])) : '—';
     const peerRows = [['Established', 'peers'], ['Connecting', 'connecting'], ['Outbound', 'outbound'], ['Inbound', 'inbound'], ['Known addresses', 'known'], ['Peer discovery', 'discovery']].map(([k, key]) => ({ k, v: pv(key), vc: nv }));
     const nodeRows = [
-      { k: 'State', v: online ? 'Online · RPC ready' : offline ? 'Offline' : 'Connecting…', vc: online ? OK : offline ? ERR : SUB },
+      { k: 'State', v: nodeState, vc: nodeStateColor },
       { k: 'Network', v: 'Shadownet', vc: INK },
       { k: 'Height', v: st ? '#' + grp(st.height) : '—', vc: nv },
+      { k: 'Chain tip age', v: ready.tipAge == null ? '—' : hms(ready.tipAge * 1000), vc: ready.tipFresh === true ? OK : ready.tipFresh === false ? WARN : nv },
+      { k: 'Tip agreement', v: !online ? '—' : ready.regtest ? 'Not required on regtest' : ready.tipMatches === true ? 'Matches its peers' : ready.peerChainKnown ? 'Differs from its peers' : 'Not reported by the node', vc: ready.tipMatches === true ? OK : online && ready.peerChainKnown ? ERR : WARN },
       { k: 'Blocks stored', v: st ? grp(st.blocks) : '—', vc: nv },
       { k: 'Mempool', v: st ? grp(st.mempool) + ' tx' : '—', vc: nv },
       { k: 'Orphan blocks', v: st ? grp(st.orphans) : '—', vc: nv }
@@ -773,7 +867,7 @@ class Component extends React.Component {
 
     // status bar
     const sbar = [
-      { text: online ? 'Node online' : offline ? 'Node offline' : 'Connecting', dot: online ? OK : offline ? ERR : '#c9c8c1', fg: online ? INK : offline ? ERR : SUB, r: '50%', title: online ? 'Local RPC ready. This is not a sync percentage.' : N.err || '' },
+      { text: waiting ? 'Node busy' : online ? 'Node online' : offline ? 'Node offline' : 'Connecting', dot: waiting ? WARN : online ? OK : offline ? ERR : '#c9c8c1', fg: waiting ? WARN : online ? INK : offline ? ERR : SUB, r: '50%', title: waiting ? N.err || 'The node did not answer in time.' : online ? 'Local RPC ready. This is not a sync percentage.' : N.err || '' },
       { text: pe && online ? `${pe.peers} peer${pe.peers === 1 ? '' : 's'}` : 'Peers —', dot: pe && online ? (pe.peers ? OK : WARN) : '#c9c8c1', fg: pe && online && !pe.peers ? WARN : SUB, r: '50%', title: 'Established peer connections' },
       { text: st ? '#' + grp(st.height) : 'Height —', dot: 'transparent', fg: online ? INK : FAINT, r: '0', title: 'Local chain height' }
     ];
@@ -851,7 +945,7 @@ class Component extends React.Component {
       review: () => { const k = this.sendCalc(); if (k.blocker) { this.setSend({ touched: { to: true, amount: true } }); return; } this.showDialog({ type: 'review', from: k.from, to: k.toL, label: s.send.label.trim(), recv: k.recv, fee: k.fee, debit: k.debit, subtract: s.send.subtract, busy: false }); },
       cancelReview: () => this.closeDlg(), confirmSend: () => this.confirmSend(),
       rc,
-      mc, prereq, sessCells, lifeCells, solve, engineRows, once, mineErr: s.mineErr, intervalStr: s.intervalStr, onceStr: s.onceStr,
+      mc, prereq, solo, sessCells, lifeCells, solve, engineRows, once, mineErr: s.mineErr, intervalStr: s.intervalStr, onceStr: s.onceStr,
       onMineWallet: e => this.setState({ mineWallet: e.target.value, mineErr: null }),
       onInterval: e => this.setState({ intervalStr: e.target.value }),
       onIntensity: e => this.setMiningIntensity(e.target.value),

@@ -22,7 +22,12 @@ const {
   resolveRuntime
 } = require('./runtime-config');
 const { WalletSecretStore } = require('./wallet-secret-store');
-const { loadMiningPreferences, saveMiningPreferences, researchPaused } = require('./mining-preferences');
+const {
+  DEFAULT_MINING_INTENSITY,
+  loadMiningPreferences,
+  saveMiningPreferences,
+  researchPaused
+} = require('./mining-preferences');
 const {
   listWallets,
   normalizeWalletName,
@@ -30,9 +35,11 @@ const {
   walletFilePath
 } = require('./wallet-files');
 const { PublisherService } = require('./explorer-publisher-service');
+const { miningGate } = require('./mining-gate');
 const {
   blockCount,
   miningIntensity,
+  soloMiningOverride,
   laserAddress,
   laserValue,
   MAX_PROTOCOL_PHOTONS
@@ -592,6 +599,70 @@ function laserCmd(args, timeout = 15000) {
   });
 }
 
+// The CLI gives every RPC socket a fixed three second receive deadline and the
+// daemon answers RPC on one thread, so a poll that fans out several laser.exe
+// calls at once makes all of them queue past that deadline while the chain is
+// catching up. The CLI reports a refused connection and a missed deadline with
+// the same text, so read-only polls run one at a time, a missed deadline is
+// retried, and the outcome of the last attempt is recorded for the renderer.
+const RPC_READ_DEADLINE_MS = 3000;
+const RPC_READ_ATTEMPTS = rpcReadAttempts(process.env.LASER_CORE_RPC_ATTEMPTS);
+let rpcReadQueue = Promise.resolve();
+let lastRpcRead = { kind: 'unknown', at: null, attempts: 0, elapsedMs: 0, error: null };
+
+function rpcReadAttempts(value) {
+  const requested = Number(value);
+  return Number.isInteger(requested) && requested >= 1 && requested <= 10 ? requested : 2;
+}
+
+function rpcQueue(task) {
+  const result = rpcReadQueue.then(task, task);
+  rpcReadQueue = result.then(() => {}, () => {});
+  return result;
+}
+
+async function rpcReadAttempt(args, timeout) {
+  let attempts = 0;
+  let elapsedMs = 0;
+  let failure = null;
+  while (attempts < RPC_READ_ATTEMPTS) {
+    const startedAt = Date.now();
+    attempts++;
+    try {
+      const raw = await laserCmd(args, timeout);
+      lastRpcRead = {
+        kind: 'ok', at: Date.now(), attempts,
+        elapsedMs: Date.now() - startedAt, error: null
+      };
+      return raw;
+    } catch (error) {
+      elapsedMs = Date.now() - startedAt;
+      failure = error;
+      if (elapsedMs < RPC_READ_DEADLINE_MS) break;
+    }
+  }
+  const running = Boolean(laserdProcess && !hasProcessExited(laserdProcess));
+  const busy = elapsedMs >= RPC_READ_DEADLINE_MS;
+  const seconds = (RPC_READ_DEADLINE_MS / 1000).toFixed(0);
+  const message = busy
+    ? `The local node is listening on ${LASER_RPC} but did not answer within ` +
+      `${seconds} s on ${attempts} attempt${attempts === 1 ? '' : 's'}. Its RPC ` +
+      'thread is busy, which is normal while the chain catches up.'
+    : `Cannot reach the local node at ${LASER_RPC}. ` +
+      (running
+        ? 'The node process is running but its RPC interface refused the request.'
+        : 'The node process is not running.');
+  lastRpcRead = {
+    kind: busy ? 'busy' : 'unreachable', at: Date.now(), attempts, elapsedMs,
+    error: failure ? failure.message : null
+  };
+  throw new Error(message);
+}
+
+function rpcRead(args, timeout = 15000) {
+  return rpcQueue(() => rpcReadAttempt(args, timeout));
+}
+
 const WALLET_SECRET_TTL_MS = 5 * 60 * 1000;
 const walletSecrets = new WalletSecretStore({ ttlMs: WALLET_SECRET_TTL_MS });
 
@@ -736,7 +807,8 @@ registerMainHandler('laser:startup', () => ({
   storeVersion: runtime.storeVersion,
   node: LASERD_BIN,
   cli: LASER_BIN,
-  shadow: currentShadowState()
+  shadow: currentShadowState(),
+  rpc: { ...lastRpcRead }
 }));
 
 registerSplashHandler('splash:identity', () => ({
@@ -747,15 +819,53 @@ registerSplashHandler('splash:identity', () => ({
   build: activeBuildIdentity()
 }));
 
+const MINING_GATE_REFUSALS = {
+  'chain-unreadable': 'the node did not report a readable chain tip',
+  peers: 'the node has no established peers',
+  'peer-chain-unknown': 'the node does not report the best height and tip hash '
+    + 'its peers announce, so the local tip cannot be confirmed as current',
+  height: 'the local chain is behind the best height its peers report',
+  tip: 'the local tip hash differs from the best chain its peers report'
+};
+
+// The renderer only ever disables a button. This re-reads the chain and
+// refuses here so a renderer fault cannot mine on a chain that is not current.
+async function requireCurrentChain(soloOverride) {
+  let status;
+  try {
+    const raw = await rpcRead([
+      'node', 'status', '--rpc', LASER_RPC,
+      '--datadir', LASER_DATADIR, '--network', LASER_NETWORK, '--json'
+    ]);
+    status = parseExactJSON(raw);
+  } catch (error) {
+    throw new Error('Mining needs a current chain and the node did not report '
+      + 'one. ' + error.message);
+  }
+  const gate = miningGate(status, { soloOverride });
+  if (gate.ok) return gate;
+  const refusal = MINING_GATE_REFUSALS[gate.blocked_by] || 'the chain is not current';
+  throw new Error(`Mining is refused: ${refusal}.`
+    + (gate.blocks_behind ? ` Local height ${gate.local_height}, peers report `
+      + `${gate.peer_best_height}.` : '')
+    + (gate.overridable
+      ? ' Turn on the solo mining override if you intend to mine on your own.'
+      : ''));
+}
+
 registerMainHandler('laser:status', async () => {
   try {
-    const raw = await laserCmd([
+    const raw = await rpcRead([
       'node', 'status', '--rpc', LASER_RPC,
       '--datadir', LASER_DATADIR, '--network', LASER_NETWORK, '--json'
     ]);
     const status = parseExactJSON(raw);
     markNodeReady(status);
-    return { ...status, shadow: currentShadowState() };
+    return {
+      ...status,
+      shadow: currentShadowState(),
+      mining_gate: miningGate(status)
+    };
   } catch (error) {
     explorerPublisher?.setNodeReady(false);
     throw error;
@@ -769,7 +879,7 @@ registerMainHandler('laser:publisher-save', (_event, input) => {
 });
 
 registerMainHandler('laser:peers', async () => {
-  const raw = await laserCmd([
+  const raw = await rpcRead([
     'peer', 'list', '--rpc', LASER_RPC,
     '--datadir', LASER_DATADIR, '--network', LASER_NETWORK, '--json'
   ]);
@@ -870,10 +980,10 @@ registerMainHandler('laser:copy-address', (_event, address) => {
 
 async function queryMinerMetrics(wallet) {
   const name = walletName(wallet);
-  const raw = await walletCommand([
+  const raw = await rpcQueue(() => walletCommand([
     'node', 'miner', name, '--rpc', LASER_RPC,
     '--datadir', LASER_DATADIR, '--network', LASER_NETWORK, '--json'
-  ], name);
+  ], name));
   return parseExactJSON(raw);
 }
 
@@ -893,9 +1003,10 @@ function miningIntensityArgs(intensity) {
   return ['--intensity', String(value)];
 }
 
-registerMainHandler('laser:mine', async (_event, wallet, count, intensity = 100) => {
+registerMainHandler('laser:mine', async (_event, wallet, count, intensity = DEFAULT_MINING_INTENSITY, solo) => {
   const name = walletName(wallet);
   const requestedCount = blockCount(count);
+  await requireCurrentChain(soloMiningOverride(solo));
   await setMiningIntensity(intensity);
   return await walletCommand([
     'node', 'mine', name, String(requestedCount),
@@ -1006,13 +1117,14 @@ registerMainHandler('laser:mine-intensity', async (_event, intensity) => {
   return miningStatus();
 });
 
-registerMainHandler('laser:mine-start', async (_event, wallet, intervalMs, intensity = 100) => {
+registerMainHandler('laser:mine-start', async (_event, wallet, intervalMs, intensity = DEFAULT_MINING_INTENSITY, solo) => {
   if (!wallet || !String(wallet).trim()) {
     throw new Error('Load a wallet before auto-mining.');
   }
   const requestedWallet = walletName(wallet);
   miningIntensityArgs(intensity);
   if (miningEnabled) return miningStatus();
+  await requireCurrentChain(soloMiningOverride(solo));
   await setMiningIntensity(intensity);
   mineIntervalMs = Number.isInteger(intervalMs) && intervalMs >= 1000
     ? Math.min(intervalMs, 600000)

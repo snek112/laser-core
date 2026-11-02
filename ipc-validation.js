@@ -17,6 +17,17 @@ function miningIntensity(value = 100) {
   return value;
 }
 
+// Mining on a chain the network has moved past is refused by default, so the
+// override past that refusal has to be a deliberate boolean, never a value
+// that merely looks truthy.
+function soloMiningOverride(value) {
+  if (value === undefined || value === null || value === false) return false;
+  if (value !== true) {
+    throw new Error('The solo mining override must be true or false.');
+  }
+  return true;
+}
+
 function laserAddress(value) {
   const address = String(value || '').trim().toLowerCase();
   if (!/^[0-9a-f]{64}$/.test(address)) {
@@ -48,6 +59,7 @@ function laserValue(value, label, allowZero) {
 module.exports = {
   blockCount,
   miningIntensity,
+  soloMiningOverride,
   laserAddress,
   laserValue,
   MAX_PROTOCOL_PHOTONS

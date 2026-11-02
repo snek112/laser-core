@@ -461,6 +461,10 @@
         </sc-for>
       </div>
       <div id="mine-iv-help" style="font-size:12px;line-height:1.5;color:#62646b">{{ mc.ivHelp }}</div>
+      <div style="display:grid;gap:6px;padding:10px 12px;background:#fbfbf9;border:1px solid #e6e5e0;border-radius:3px">
+        <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;cursor:pointer"><input type="checkbox" checked="{{ solo.on }}" onChange="{{ solo.toggle }}" disabled="{{ solo.disabled }}" aria-describedby="mine-solo-help" style="width:14px;height:14px;margin:0;accent-color:#8a4b00">{{ solo.label }}</label>
+        <div id="mine-solo-help" style="font-size:12px;line-height:1.5;color:{{ solo.fg }}">{{ solo.help }}</div>
+      </div>
       <sc-if value="{{ mc.hasErr }}" hint-placeholder-val="{{ false }}">
         <div role="alert" style="padding:8px 10px;background:#fbeef0;border:1px solid #efc6cf;border-radius:3px;font-size:12.5px;line-height:1.5;color:#a1203d;display:flex;gap:10px;align-items:baseline"><span style="font:500 10px 'Geist Mono',monospace;letter-spacing:0.1em;text-transform:uppercase">Error</span><span style="flex:1">{{ mineErr }}</span></div>
       </sc-if>

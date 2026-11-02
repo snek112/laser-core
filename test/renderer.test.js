@@ -1,6 +1,6 @@
 const assert=require('node:assert/strict');
 const test=require('node:test');
-const {setup}=require('./renderer-harness');
+const {setup,TIP,DEFAULT_INTENSITY}=require('./renderer-harness');
 async function ready(bridge={}){const h=setup(bridge);h.unlocked.add('Alice');h.unlocked.add('Bob');await h.app.refreshWallets('Alice');await h.app.poll();return h;}
 
 test('startup lists encrypted wallets without opening or mining them',async()=>{
@@ -99,7 +99,7 @@ test('continuous and one-shot mining require explicit actions and cannot overlap
   const h=await ready();await h.app.mineToggle();assert.equal(h.calls.filter(c=>c[0]==='mineStart').length,1);
   await h.app.mineOnce();assert.ok(!h.calls.some(c=>c[0]==='mine'));
   await h.app.mineToggle();h.app.state.onceStr='101';await h.app.mineOnce();assert.match(h.app.state.onceMsg.text,/1 to 100/);
-  h.app.state.onceStr='2';await h.app.mineOnce();assert.deepEqual(h.calls.find(c=>c[0]==='mine'),['mine','Alice',2,100]);
+  h.app.state.onceStr='2';await h.app.mineOnce();assert.deepEqual(h.calls.find(c=>c[0]==='mine'),['mine','Alice',2,DEFAULT_INTENSITY,false]);
 });
 test('copy failures and unavailable metrics are visible',async()=>{
   const h=await ready({copyAddress:async()=>{throw new Error('Clipboard unavailable');}});await h.app.copyAddr();assert.match(h.app.renderVals().rc.copyMsg,/Clipboard unavailable/);
@@ -111,20 +111,20 @@ test('intensity is saved and passed to continuous and one-shot mining',async()=>
   assert.equal(h.app.state.intensity,25);
   assert.equal(JSON.parse(h.storage.get('laser-core.preferences.v1')).miningIntensity,25);
   assert.ok(!h.calls.some(c=>c[0]==='mineStart'||c[0]==='mine'));
-  await h.app.mineToggle();assert.deepEqual(h.calls.find(c=>c[0]==='mineStart'),['mineStart','Alice',10000,25]);
+  await h.app.mineToggle();assert.deepEqual(h.calls.find(c=>c[0]==='mineStart'),['mineStart','Alice',10000,25,false]);
   assert.equal(h.app.renderVals().mc.intensityDisabled,false);
   await h.app.setMiningIntensity('10');assert.equal(h.app.state.mining.mining,true);
   assert.ok(!h.calls.some(c=>c[0]==='mineStop'));
-  await h.app.mineToggle();await h.app.mineOnce();assert.deepEqual(h.calls.find(c=>c[0]==='mine'),['mine','Alice',1,10]);
+  await h.app.mineToggle();await h.app.mineOnce();assert.deepEqual(h.calls.find(c=>c[0]==='mine'),['mine','Alice',1,10,false]);
   const restored=setup({},Object.fromEntries(h.storage));assert.equal(restored.app.state.intensity,10);
 });
 
 test('intensity changes report errors without saving an unapplied choice',async()=>{
   const h=await ready({mineSetIntensity:async()=>{throw new Error('Unavailable');}});
-  await h.app.setMiningIntensity('25');assert.equal(h.app.state.intensity,100);
+  await h.app.setMiningIntensity('50');assert.equal(h.app.state.intensity,DEFAULT_INTENSITY);
   assert.equal(h.app.state.intensityBusy,false);assert.equal(h.app.state.mineErr,'Unavailable');
   assert.equal(h.storage.has('laser-core.preferences.v1'),false);
-  assert.equal(setup({}, {'laser-core.preferences.v1':'{"miningIntensity":0}'}).app.state.intensity,100);
+  assert.equal(setup({}, {'laser-core.preferences.v1':'{"miningIntensity":0}'}).app.state.intensity,DEFAULT_INTENSITY);
 });
 
 test('startup honors persisted intensity and distinguishes paused research from failure',async()=>{
@@ -158,6 +158,96 @@ test('submission receipt preserves exact amounts and transaction ID without clai
 test('peer-query failure does not incorrectly mark an answering node offline',async()=>{
   const h=setup({peers:async()=>{throw new Error('Peers unavailable');}});await h.app.poll();assert.equal(h.app.state.node.online,true);assert.match(h.app.renderVals().net.kicker,/unavailable/);
 });
+test('the interface refuses mining on a chain its peers have moved past',async()=>{
+  const h=await ready();
+  h.chain.peer_best_height=58705;h.chain.peer_best_tip='cd'.repeat(32);
+  await h.app.poll();
+  const before=h.app.renderVals();
+  assert.equal(before.mc.btnDisabled,true);
+  assert.equal(before.once.btnDisabled,true);
+  assert.match(before.mc.sub,/blocks behind its peers/);
+  assert.match(before.banner.text,/58,705/);
+  assert.equal(before.banner.label,'Mining blocked');
+  await h.app.mineToggle();
+  assert.ok(!h.calls.some(c=>c[0]==='mineStart'));
+  assert.match(h.app.state.mineErr,/orphaned/);
+  h.app.state.onceStr='1';await h.app.mineOnce();
+  assert.ok(!h.calls.some(c=>c[0]==='mine'));
+  assert.equal(h.app.state.onceMsg.err,true);
+});
+
+test('the solo override is explicit, passed to the node and recorded in the activity log',async()=>{
+  const h=await ready();
+  h.chain.peers=0;h.chain.peer_best_height=undefined;h.chain.peer_best_tip=undefined;
+  await h.app.poll();
+  assert.equal(h.app.renderVals().solo.on,false);
+  await h.app.mineToggle();assert.ok(!h.calls.some(c=>c[0]==='mineStart'));
+  h.app.renderVals().solo.toggle();
+  const armed=h.app.renderVals();
+  assert.equal(armed.solo.on,true);
+  assert.equal(armed.mc.btnDisabled,false);
+  assert.match(armed.mc.title,/solo override/);
+  await h.app.mineToggle();
+  assert.deepEqual(h.calls.find(c=>c[0]==='mineStart'),['mineStart','Alice',10000,DEFAULT_INTENSITY,true]);
+  assert.ok(h.app.state.activity.some(a=>a.kind==='warn'&&/Solo mining override/.test(a.text)));
+});
+
+test('regtest mines without network agreement and a matched tip needs no override',async()=>{
+  const h=await ready();
+  h.chain.network='regtest';h.chain.peers=0;
+  h.chain.peer_best_height=undefined;h.chain.peer_best_tip=undefined;
+  await h.app.poll();
+  assert.equal(h.app.renderVals().banner.show,false);
+  await h.app.mineToggle();
+  assert.deepEqual(h.calls.find(c=>c[0]==='mineStart'),['mineStart','Alice',10000,DEFAULT_INTENSITY,false]);
+
+  const matched=await ready();
+  assert.equal(matched.app.state.node.status.mining_gate.tip_matches,true);
+  assert.equal(matched.app.renderVals().mc.btnDisabled,false);
+  await matched.app.mineToggle();
+  assert.ok(matched.calls.some(c=>c[0]==='mineStart'));
+});
+
+test('a timed-out status call reads as a busy node, not an offline one',async()=>{
+  let answering=true;
+  const h=await ready();
+  const answer=h.laser.status;
+  h.laser.status=async()=>{
+    if(!answering)throw new Error('The local node is listening on 127.0.0.1:19544 but did not answer within 3 s on 2 attempts.');
+    return answer();
+  };
+  h.laser.startup=async()=>({running:true,ready:true,rpc:{kind:answering?'ok':'busy'}});
+  await h.app.poll();
+  assert.equal(h.app.state.node.online,true);
+  answering=false;await h.app.poll();
+  assert.equal(h.app.state.node.waiting,true);
+  assert.equal(h.app.state.node.online,true,'a busy node is never reported offline');
+  const busy=h.app.renderVals();
+  assert.equal(busy.banner.label,'Node busy');
+  assert.equal(busy.sbar[0].text,'Node busy');
+  assert.equal(busy.net.kicker,'Busy');
+  assert.equal(h.app.state.activity[0].kind,'warn');
+  assert.match(h.app.state.activity[0].text,/busy and did not answer in time/);
+  assert.ok(!h.app.state.activity.some(a=>/Lost connection/.test(a.text)));
+  // Readings stay, marked stale, instead of being cleared as unavailable.
+  assert.equal(busy.bal.stale,true);
+  assert.match(busy.bal.availSub,/node busy/);
+  answering=true;await h.app.poll();
+  assert.equal(h.app.state.node.waiting,false);
+  assert.match(h.app.state.activity[0].text,/answering again/);
+});
+
+test('an unreachable node is still reported as a lost connection',async()=>{
+  const h=await ready();
+  h.laser.status=async()=>{throw new Error('Cannot reach the local node at 127.0.0.1:19544.');};
+  h.laser.startup=async()=>({running:false,ready:false,rpc:{kind:'unreachable'}});
+  await h.app.poll();
+  assert.equal(h.app.state.node.online,false);
+  assert.equal(h.app.state.node.waiting,false);
+  assert.match(h.app.state.activity[0].text,/Lost connection/);
+  assert.equal(h.app.renderVals().sbar[0].text,'Node offline');
+});
+
 test('remote blocks are logged as chain advances, never local mining rewards',async()=>{
   const h=setup();h.app.state.node={online:true,lastOk:1,status:{height:10}};await h.app.poll();
   assert.equal(h.app.state.activity[0].kind,'chain');assert.match(h.app.state.activity[0].text,/Chain advanced/);

@@ -4,10 +4,10 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const test = require('node:test');
-const { miningIntensity, blockCount } = require('../ipc-validation');
-const { researchPaused } = require('../mining-preferences');
+const { miningIntensity, blockCount, soloMiningOverride } = require('../ipc-validation');
+const { researchPaused, DEFAULT_MINING_INTENSITY } = require('../mining-preferences');
 
-function harness(channel = 'v3', savedIntensity = 100) {
+function harness(channel = 'v3', savedIntensity = 100, chainReady = true) {
   const handlers = new Map(), jobs = [], timers = [], controls = [];
   const source = fs.readFileSync(path.join(__dirname, '../main.js'), 'utf8');
   const miningSource = source.slice(source.indexOf('function miningIntensityArgs('), source.indexOf("registerMainHandler('laser:send'"));
@@ -16,7 +16,12 @@ function harness(channel = 'v3', savedIntensity = 100) {
     path, app: {getPath: () => 'isolated'},
     loadMiningPreferences: () => ({intensity:savedIntensity,saved:true}),
     saveMiningPreferences: (_file, intensity) => controls.push(['save-intensity',intensity]),
-    researchPaused, nodeReady:true, shadowError:null,
+    researchPaused, DEFAULT_MINING_INTENSITY, soloMiningOverride,
+    requireCurrentChain: async solo => {
+      controls.push(['require-current-chain', solo]);
+      if (!chainReady) throw new Error('Mining is refused: the local chain is behind the best height its peers report.');
+    },
+    nodeReady:true, shadowError:null,
     stopShadow: async () => {controls.push(['pause-research']);return true;},
     startShadow: () => {controls.push(['resume-research']);return true;},
     registerMainHandler: (name, fn) => handlers.set(name, fn),
@@ -31,6 +36,27 @@ function harness(channel = 'v3', savedIntensity = 100) {
   vm.runInNewContext(miningSource, context);
   return { jobs, timers, controls, call: (name, ...args) => handlers.get('laser:' + name)(null, ...args) };
 }
+
+test('the main process re-checks the chain before mining and carries the override', async () => {
+  const armed = harness();
+  await armed.call('mine-start', 'Example', 10000, 25, true);
+  assert.deepEqual(armed.controls.filter(c => c[0] === 'require-current-chain'),
+    [['require-current-chain', true]]);
+  armed.jobs[0].resolve('Mined');await new Promise(r => setImmediate(r));
+
+  const plain = harness();
+  await plain.call('mine-start', 'Example', 10000, 25);
+  assert.deepEqual(plain.controls.filter(c => c[0] === 'require-current-chain'),
+    [['require-current-chain', false]]);
+  plain.jobs[0].resolve('Mined');await new Promise(r => setImmediate(r));
+  await assert.rejects(plain.call('mine', 'Example', 1, 25, 'yes'), /true or false/);
+
+  const behind = harness('v3', 100, false);
+  await assert.rejects(behind.call('mine-start', 'Example', 10000, 25), /behind the best height/);
+  await assert.rejects(behind.call('mine', 'Example', 1, 25), /behind the best height/);
+  assert.equal(behind.jobs.length, 0);
+  assert.equal(behind.call('mine-status').mining, false);
+});
 
 test('an intensity change preserves the active job and reaches the next cycle', async () => {
   const h = harness();

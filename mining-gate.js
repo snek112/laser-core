@@ -8,14 +8,10 @@
 // announced, by height and by tip hash, so a node sitting at the right height
 // on a forked or stale chain is still refused.
 //
-// No current node build reports that peer chain over RPC. `node status`
-// returns this node's own chain only - network, height, tip, chain_work,
-// median_time_past and an established peer count - and `peer list` returns
-// connection counters with no per-peer height or tip. The daemon has to
-// surface the announced best chain as peer_best_height and peer_best_tip on
-// the status reply before the comparison can resolve. Until it does, the gate
-// reports 'peer-chain-unknown' and refuses; the solo override and the regtest
-// exemption are the two deliberate ways past it.
+// Updated nodes expose fresh, completed header-sync observations as
+// peer_best_height/peer_best_tip. Older runtimes or nodes still discovering,
+// syncing, or refreshing their peer view fail closed. These observations are
+// a local readiness check, not proof of agreement by the whole network.
 const PEER_MINIMUM = 1;
 const EXEMPT_NETWORKS = new Set(['regtest']);
 const OVERRIDABLE = new Set(['peers', 'peer-chain-unknown', 'height', 'tip']);
@@ -34,11 +30,14 @@ function tipHash(value) {
 }
 
 function count(value) {
+  if (typeof value !== 'number' &&
+      !(typeof value === 'string' && /^\d+$/.test(value))) return null;
   const number = Number(value);
   return Number.isSafeInteger(number) && number >= 0 ? number : null;
 }
 
 function peerChainView(status) {
+  if (status.peer_chain_known === false || status.peer_chain_known === 0) return null;
   const height = count(status.peer_best_height);
   const tip = tipHash(status.peer_best_tip);
   return height === null || tip === null ? null : { height, tip };

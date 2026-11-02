@@ -645,9 +645,9 @@ async function rpcReadAttempt(args, timeout) {
   const busy = elapsedMs >= RPC_READ_DEADLINE_MS;
   const seconds = (RPC_READ_DEADLINE_MS / 1000).toFixed(0);
   const message = busy
-    ? `The local node is listening on ${LASER_RPC} but did not answer within ` +
-      `${seconds} s on ${attempts} attempt${attempts === 1 ? '' : 's'}. Its RPC ` +
-      'thread is busy, which is normal while the chain catches up.'
+    ? `The local node at ${LASER_RPC} did not answer within ` +
+      `${seconds} s on ${attempts} attempt${attempts === 1 ? '' : 's'}. ` +
+      'It may be busy validating blocks; its current status is unknown.'
     : `Cannot reach the local node at ${LASER_RPC}. ` +
       (running
         ? 'The node process is running but its RPC interface refused the request.'
@@ -1124,8 +1124,12 @@ registerMainHandler('laser:mine-start', async (_event, wallet, intervalMs, inten
   const requestedWallet = walletName(wallet);
   miningIntensityArgs(intensity);
   if (miningEnabled) return miningStatus();
-  await requireCurrentChain(soloMiningOverride(solo));
+  const sessionSolo = soloMiningOverride(solo);
+  const startGeneration = mineGeneration;
+  await requireCurrentChain(sessionSolo);
+  if (startGeneration !== mineGeneration) return miningStatus();
   await setMiningIntensity(intensity);
+  if (startGeneration !== mineGeneration) return miningStatus();
   mineIntervalMs = Number.isInteger(intervalMs) && intervalMs >= 1000
     ? Math.min(intervalMs, 600000)
     : 10000;
@@ -1138,9 +1142,11 @@ registerMainHandler('laser:mine-start', async (_event, wallet, intervalMs, inten
     } catch (error) {
       console.warn('[laser-core] Miner baseline unavailable:', error.message);
     }
+    if (startGeneration !== mineGeneration) return miningStatus();
     resetMiningSession(requestedWallet, baseline);
   }
 
+  if (startGeneration !== mineGeneration) return miningStatus();
   if (miningEnabled) {
     return miningStatus();
   }
@@ -1151,10 +1157,25 @@ registerMainHandler('laser:mine-start', async (_event, wallet, intervalMs, inten
   const doMine = async () => {
     if (!miningEnabled || generation !== mineGeneration) return;
     const jobWallet = mineWallet;
-    const jobStartedAt = Date.now();
-    mineActiveIntensity = mineIntensity;
     mineNextRunAt = null;
     try {
+      /* Recheck every cycle, including after baseline/observer work on the
+         first cycle. Stop while a stale status or lost agreement is resolved;
+         the user explicitly resumes the session when ready. */
+      try {
+        await requireCurrentChain(sessionSolo);
+      } catch (error) {
+        if (generation === mineGeneration && miningEnabled) {
+          miningEnabled = false;
+          mineSessionErrors++;
+          if (mainWindow) mainWindow.webContents.send('mine:error',
+            'Automatic mining stopped. ' + error.message, miningStatus());
+        }
+        return;
+      }
+      if (!miningEnabled || generation !== mineGeneration) return;
+      const jobStartedAt = Date.now();
+      mineActiveIntensity = mineIntensity;
       await walletCommand([
         'node', 'mine', jobWallet, '1',
         ...miningIntensityArgs(mineActiveIntensity),

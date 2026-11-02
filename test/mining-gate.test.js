@@ -69,7 +69,7 @@ test('regtest is exempt from network agreement',()=>{
   assert.equal(miningGate(chain({network:'shadow',peers:0}),{now}).regtest_exempt,false);
 });
 
-test('the node reports no peer chain today, so the gate fails closed',()=>{
+test('older runtimes with no peer chain fail closed',()=>{
   // What a current node answers to `node status --json`: its own chain and an
   // established peer count, with no peer_best_height or peer_best_tip.
   const reported=miningGate({network:'shadow',height:57025,
@@ -81,6 +81,15 @@ test('the node reports no peer chain today, so the gate fails closed',()=>{
   assert.equal(reported.peer_best_tip,null);
   assert.equal(reported.blocked_by,'peer-chain-unknown');
   assert.equal(reported.ok,false);
+});
+
+test('unknown or malformed peer observations cannot grant permission to mine',()=>{
+  assert.equal(miningGate(chain({peer_chain_known:false})).ok,false);
+  for(const value of [null,false,'',[],{},'1.5',-1,Number.MAX_SAFE_INTEGER+1]) {
+    assert.equal(miningGate(chain({height:value})).blocked_by,'chain-unreadable');
+    assert.equal(miningGate(chain({peer_best_height:value})).blocked_by,'peer-chain-unknown');
+  }
+  assert.equal(miningGate(chain({peer_chain_known:true,height:'5000',peer_best_height:'5000'})).ok,true);
 });
 
 test('tip age is reported for the interface but never gates mining',()=>{

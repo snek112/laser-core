@@ -15,6 +15,15 @@
 
 ## Start mining
 
+Development source checks fresh peer-chain observations before mining and
+before each automatic one-block job. It requires an updated native CLI and
+daemon exposing `peer_chain_known`, `peer_best_height`, and `peer_best_tip`;
+see [the node's readiness contract](https://github.com/Laser-Chain/laser-node/blob/main/docs/peer-chain-status.md).
+Older native runtimes fail closed until upgraded. If agreement is lost,
+automatic mining stops and must be explicitly resumed. Regtest is exempt;
+the explicit solo override remains available for deliberate isolated mining.
+These source changes do not update the existing beta.4 download below.
+
 Laser Core currently supports Windows 10/11 x64. The portable client starts a
 validating node automatically, connects to Shadownet peers, manages encrypted
 wallets, and mines to the wallet you select.

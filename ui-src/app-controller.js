@@ -301,10 +301,10 @@ class Component extends React.Component {
           }
           Object.assign(node, { online: true, waiting: false, status, peers, err: null, lastOk: Date.now() });
         } else if (waiting) {
-          // A missed RPC deadline is a busy node, not a stopped one. This list
+          // A missed deadline does not establish whether the node is stopped. This list
           // is the only diagnostic record the portable build keeps, so it must
           // not claim the node went away.
-          if (!node.waiting) act.unshift(this.ev('warn', 'The local node is busy and did not answer in time', err));
+          if (!node.waiting) act.unshift(this.ev('warn', 'The local node did not answer in time; status is unknown', err));
           Object.assign(node, { waiting: true, err });
         } else {
           if (node.online !== false && node.lastOk) act.unshift(this.ev('err', 'Lost connection to the local node', err));
@@ -497,10 +497,10 @@ class Component extends React.Component {
       reason: 'Laser Core cannot read the chain state from the local node, so it cannot tell whether a mined block would build on the current tip.' };
     const tipAge = g.tip_age_seconds === null ? null : hms(g.tip_age_seconds * 1000);
     const blocked = {
-      peers: 'The node has no established peers, so it cannot know which chain the network is on. Blocks mined now would extend a private chain that Shadownet discards.',
-      'peer-chain-unknown': `The node reports its own tip, #${grp(g.local_height)} ${short(g.local_tip || '')}, but not the best height and tip hash its peers announce, so Laser Core cannot confirm that tip is the network’s.${tipAge ? ` The tip is ${tipAge} old.` : ''}`,
-      height: `The node is ${grp(g.blocks_behind)} block${g.blocks_behind === 1 ? '' : 's'} behind its peers: local height #${grp(g.local_height)} against #${grp(g.peer_best_height)} reported by peers. A block mined now would be orphaned.`,
-      tip: `The node is at the same height as its peers, #${grp(g.local_height)}, but on a different chain: local tip ${short(g.local_tip || '')} against ${short(g.peer_best_tip || '')}. A block mined now would be orphaned.`,
+      peers: 'The node has no established peers. Mining now could extend an isolated chain whose blocks other nodes do not accept.',
+      'peer-chain-unknown': `The node has not confirmed a fresh peer-chain view. Wait for peer synchronization; older node runtimes need an update. Local tip: #${grp(g.local_height)} ${short(g.local_tip || '')}.${tipAge ? ` Median block age: ${tipAge}.` : ''}`,
+      height: `The node is ${grp(g.blocks_behind)} block${g.blocks_behind === 1 ? '' : 's'} behind its peers: local height #${grp(g.local_height)} against #${grp(g.peer_best_height)} reported by peers. Mining now risks orphaned blocks.`,
+      tip: `Local tip #${grp(g.local_height)} ${short(g.local_tip || '')} differs from the observed peer tip #${grp(g.peer_best_height)} ${short(g.peer_best_tip || '')}. Wait for agreement before mining.`,
       'chain-unreadable': 'The node did not report a readable chain tip, so Laser Core cannot tell which chain a mined block would extend.'
     }[g.blocked_by] || '';
     const ok = g.ok === true || (solo && g.overridable === true);
@@ -590,7 +590,7 @@ class Component extends React.Component {
     // A missed RPC deadline leaves a live node that is simply behind on its
     // replies. Its last readings are stale, but it is not offline.
     const waiting = online && !!N.waiting, stale = (offline || waiting) && !!N.lastOk;
-    const nodeState = waiting ? 'Online · busy' : online ? 'Online · RPC ready' : offline ? 'Offline' : 'Connecting…';
+    const nodeState = waiting ? 'Awaiting status' : online ? 'Online · RPC ready' : offline ? 'Offline' : 'Connecting…';
     const nodeStateColor = waiting ? WARN : online ? OK : offline ? ERR : SUB;
     const nv = online ? INK : FAINT;
     const sel = s.selected, selUnl = !!s.unlocked[sel], rec = s.records[sel];
@@ -645,7 +645,7 @@ class Component extends React.Component {
     if (starting) banner = { show: true, bg: '#fbf3e6', border: '#ecd4b0', fg: WARN, label: 'Node starting', text: 'The node is loading and verifying your saved chain. This can take several minutes. Keep Laser Core open; it will connect automatically when ready.' + (N.startup.startedAt ? ` Elapsed: ${hms(s.now - N.startup.startedAt)}.` : ''), hasDetail: false };
     else if (offline && se && !N.lastOk) banner = { show: true, bg: '#fbeef0', border: '#efc6cf', fg: ERR, label: 'Node failed to start', text: se, hasDetail: !!(N.startup.stderr?.length || N.err), detail: [Array.isArray(N.startup.stderr) ? N.startup.stderr.join('\n') : N.startup.stderr, N.err].filter(Boolean).join('\n') };
     else if (offline) banner = { show: true, bg: '#fbeef0', border: '#efc6cf', fg: ERR, label: stale ? 'Reconnecting' : 'Node offline', text: stale ? `The local node stopped answering. Grey values were last updated at ${clock(N.lastOk)}. Retrying every 2 s.` : 'Waiting for the local RPC interface. Wallet balances and mining need the node.', hasDetail: !!N.err, detail: N.err || '' };
-    else if (waiting) banner = { show: true, bg: '#fbf3e6', border: '#ecd4b0', fg: WARN, label: 'Node busy', text: `The local node is running and listening, but did not answer the status request in time. That is normal while it catches up, and Laser Core keeps asking. The values shown were last read at ${clock(N.lastOk)}.`, hasDetail: !!N.err, detail: N.err || '' };
+    else if (waiting) banner = { show: true, bg: '#fbf3e6', border: '#ecd4b0', fg: WARN, label: 'Awaiting node', text: `The local node did not answer the status request in time. It may be validating blocks. Laser Core keeps asking; the current status is unknown. The values shown were last read at ${clock(N.lastOk)}.`, hasDetail: !!N.err, detail: N.err || '' };
     else if (online && !ready.ok && ready.blockedBy !== 'chain-unreadable') banner = { show: true, bg: '#fbf3e6', border: '#ecd4b0', fg: WARN, label: 'Mining blocked', text: `${ready.reason} Wallets, balances and sending are unaffected.`, hasDetail: false };
     else if (online && pe && pe.peers === 0) banner = { show: true, bg: '#fbf3e6', border: '#ecd4b0', fg: WARN, label: 'No peers', text: `The local node is running but not connected to other Shadownet nodes${pe.connecting ? ` · ${pe.connecting} connection attempts in progress` : ''}.`, hasDetail: false };
     else if (N.online === null && s.phase === 'main') banner = { show: true, bg: '#f4f4f1', border: '#e6e5e0', fg: SUB, label: 'Connecting', text: 'Contacting the local node…', hasDetail: false };
@@ -667,9 +667,9 @@ class Component extends React.Component {
     const bal = {
       none: balState === 'none', locked: balState === 'locked', loading: balState === 'loading', open: balState === 'open', stale,
       color: stale ? FAINT : INK, avail: amt(conf),
-      availSub: stale ? `Last known at ${clock(N.lastOk)} · node ${waiting ? 'busy' : 'offline'}` : conf==null ? 'Balance unavailable from the node' : 'Confirmed on the active chain',
+      availSub: stale ? `Last known at ${clock(N.lastOk)} · ${waiting ? 'status delayed' : 'node offline'}` : conf==null ? 'Balance unavailable from the node' : 'Confirmed on the active chain',
       pendKnown, pendUnknown: !pendKnown, pend: amt(pd, true), pendColor: pd === null || pd === 0n ? INK : pd > 0n ? OK : INK,
-      pendSub: met ? `+${laser(met.pending_received_photons)} in · −${laser(met.pending_spent_photons)} out` : (stale ? `Unknown while the node is ${waiting ? 'busy' : 'offline'}` : s.metricsErr ? 'This node did not report mempool effects' : 'Waiting for node metrics'),
+      pendSub: met ? `+${laser(met.pending_received_photons)} in · −${laser(met.pending_spent_photons)} out` : (stale ? `Unknown while ${waiting ? 'status is delayed' : 'the node is offline'}` : s.metricsErr ? 'This node did not report mempool effects' : 'Waiting for node metrics'),
       proj: amt(met ? met.projected_photons : null),
       addr: rec ? short(rec.address) : '', addrFull: rec ? rec.address : '', nonce: rec ? rec.nonce : '—',
       updated: N.lastOk ? `Updated ${clock(N.lastOk)}` : ''
@@ -739,7 +739,7 @@ class Component extends React.Component {
     const ivN = Number(s.intervalStr), ivOk = Number.isInteger(ivN) && ivN >= 1 && ivN <= 120;
     const canStart = online && mwUnl && ivOk && !!mw && ready.ok;
     const prereq = [
-      { ok: online && !waiting, warn: waiting, text: waiting ? 'Node busy' : online ? 'Node online' : 'Node offline' },
+      { ok: online && !waiting, warn: waiting, text: waiting ? 'Awaiting node' : online ? 'Node online' : 'Node offline' },
       { ok: mwUnl, text: !mw ? 'No wallet' : mwUnl ? `${mw} unlocked` : `${mw} is locked` },
       { ok: ready.peers !== null && ready.peers > 0, text: ready.peers === null ? 'Peers unknown' : `${grp(ready.peers)} peer${ready.peers === 1 ? '' : 's'}` },
       ready.regtest
@@ -826,7 +826,7 @@ class Component extends React.Component {
     // network
     let net;
     if (!online) net = { fg: N.online === null ? SUB : ERR, kicker: N.online === null ? 'Connecting' : 'Offline', title: N.online === null ? 'Contacting the local node' : se && !N.lastOk ? 'The local node did not start' : 'The local node cannot be reached', sub: N.online === null ? '' : stale ? `Last successful response at ${clock(N.lastOk)}. Laser Core keeps retrying.` : 'Peer and chain information is unavailable until the RPC interface responds.' };
-    else if (waiting) net = { fg: WARN, kicker: 'Busy', title: 'The local node is running but behind on its replies', sub: `The status request passed its deadline without an answer. Readings below were last updated at ${clock(N.lastOk)}.` };
+    else if (waiting) net = { fg: WARN, kicker: 'Waiting', title: 'Waiting for the local node to answer', sub: `The status request passed its deadline without an answer. Readings below were last updated at ${clock(N.lastOk)}.` };
     else if (pe && pe.peers === 0) net = { fg: WARN, kicker: 'No peers', title: 'Running locally, not connected to Shadownet', sub: `${pe.connecting} connection attempt${pe.connecting === 1 ? '' : 's'} in progress · ${pe.known} known address${pe.known === 1 ? '' : 'es'} · discovery ${pe.discovery ? 'on' : 'off'}` };
     else if(!pe) net={fg:WARN,kicker:'Peers unavailable',title:'Local node ready',sub:'The node answered, but peer diagnostics could not be read.'};
     else net = { fg: OK, kicker: 'Connected', title: `Connected to ${pe.peers} Shadownet peer${pe.peers === 1 ? '' : 's'}`, sub: `${pe.outbound} outbound · ${pe.inbound} inbound · ${pe.connecting} connecting · local RPC ready` };
@@ -867,7 +867,7 @@ class Component extends React.Component {
 
     // status bar
     const sbar = [
-      { text: waiting ? 'Node busy' : online ? 'Node online' : offline ? 'Node offline' : 'Connecting', dot: waiting ? WARN : online ? OK : offline ? ERR : '#c9c8c1', fg: waiting ? WARN : online ? INK : offline ? ERR : SUB, r: '50%', title: waiting ? N.err || 'The node did not answer in time.' : online ? 'Local RPC ready. This is not a sync percentage.' : N.err || '' },
+      { text: waiting ? 'Awaiting node' : online ? 'Node online' : offline ? 'Node offline' : 'Connecting', dot: waiting ? WARN : online ? OK : offline ? ERR : '#c9c8c1', fg: waiting ? WARN : online ? INK : offline ? ERR : SUB, r: '50%', title: waiting ? N.err || 'The node did not answer in time.' : online ? 'Local RPC ready. This is not a sync percentage.' : N.err || '' },
       { text: pe && online ? `${pe.peers} peer${pe.peers === 1 ? '' : 's'}` : 'Peers —', dot: pe && online ? (pe.peers ? OK : WARN) : '#c9c8c1', fg: pe && online && !pe.peers ? WARN : SUB, r: '50%', title: 'Established peer connections' },
       { text: st ? '#' + grp(st.height) : 'Height —', dot: 'transparent', fg: online ? INK : FAINT, r: '0', title: 'Local chain height' }
     ];

@@ -19,7 +19,8 @@ function harness(channel = 'v3', savedIntensity = 100, chainReady = true) {
     researchPaused, DEFAULT_MINING_INTENSITY, soloMiningOverride,
     requireCurrentChain: async solo => {
       controls.push(['require-current-chain', solo]);
-      if (!chainReady) throw new Error('Mining is refused: the local chain is behind the best height its peers report.');
+      if (typeof chainReady === 'function') await chainReady();
+      else if (!chainReady) throw new Error('Mining is refused: the local chain is behind the best height its peers report.');
     },
     nodeReady:true, shadowError:null,
     stopShadow: async () => {controls.push(['pause-research']);return true;},
@@ -34,20 +35,28 @@ function harness(channel = 'v3', savedIntensity = 100, chainReady = true) {
     Date, console
   };
   vm.runInNewContext(miningSource, context);
-  return { jobs, timers, controls, call: (name, ...args) => handlers.get('laser:' + name)(null, ...args) };
+  return { jobs, timers, controls, setChainReady: value => { chainReady = value; },
+    call: (name, ...args) => {
+      const result = handlers.get('laser:' + name)(null, ...args);
+      // Model the IPC round trip while the first cycle checks readiness.
+      return name === 'mine-start' ? result.then(async value => {
+        await new Promise(resolve => setImmediate(resolve));
+        return value;
+      }) : result;
+    } };
 }
 
 test('the main process re-checks the chain before mining and carries the override', async () => {
   const armed = harness();
   await armed.call('mine-start', 'Example', 10000, 25, true);
   assert.deepEqual(armed.controls.filter(c => c[0] === 'require-current-chain'),
-    [['require-current-chain', true]]);
+    [['require-current-chain', true], ['require-current-chain', true]]);
   armed.jobs[0].resolve('Mined');await new Promise(r => setImmediate(r));
 
   const plain = harness();
   await plain.call('mine-start', 'Example', 10000, 25);
   assert.deepEqual(plain.controls.filter(c => c[0] === 'require-current-chain'),
-    [['require-current-chain', false]]);
+    [['require-current-chain', false], ['require-current-chain', false]]);
   plain.jobs[0].resolve('Mined');await new Promise(r => setImmediate(r));
   await assert.rejects(plain.call('mine', 'Example', 1, 25, 'yes'), /true or false/);
 
@@ -71,12 +80,51 @@ test('an intensity change preserves the active job and reaches the next cycle', 
   assert.ok(!h.controls.some(args=>args.includes('mine-stop')));
   h.jobs[0].resolve('Mined');await new Promise(r => setImmediate(r));
   assert.equal(h.call('mine-status').active_intensity, null);
-  h.timers.shift()();assert.equal(h.jobs.length, 2);
+  h.timers.shift()();await new Promise(r => setImmediate(r));assert.equal(h.jobs.length, 2);
   assert.equal(h.jobs[1].args[h.jobs[1].args.indexOf('--intensity') + 1], '10');
   assert.equal(h.jobs[1].timeout, 1200000);
   await h.call('mine-stop');assert.ok(h.controls.some(args=>args.includes('mine-stop')));
   h.jobs[1].reject(new Error('Cancelled'));await new Promise(r => setImmediate(r));
   assert.equal(h.timers.length, 0);assert.equal(h.call('mine-status').mining, false);
+});
+
+test('auto mining stops before the next job when chain agreement is lost', async () => {
+  const h = harness();
+  await h.call('mine-start', 'Example', 10000, 25);
+  h.jobs[0].resolve('Mined');await new Promise(r => setImmediate(r));
+  h.setChainReady(false);
+  await h.timers.shift()();
+  assert.equal(h.jobs.length, 1);
+  assert.equal(h.call('mine-status').mining, false);
+  assert.equal(h.call('mine-status').session.errors, 1);
+  assert.equal(h.timers.length, 0);
+});
+
+test('stop while a cycle is awaiting chain status cannot submit a late job', async () => {
+  const h = harness();
+  await h.call('mine-start', 'Example', 10000, 25, true);
+  h.jobs[0].resolve('Mined');await new Promise(r => setImmediate(r));
+  let release;
+  h.setChainReady(() => new Promise(resolve => { release = resolve; }));
+  const pending = h.timers.shift()();
+  await h.call('mine-stop');
+  release();await pending;
+  assert.equal(h.jobs.length, 1);
+  assert.equal(h.timers.length, 0);
+  assert.equal(h.call('mine-status').mining, false);
+  assert.deepEqual(h.controls.filter(c => c[0] === 'require-current-chain').at(-1),
+    ['require-current-chain', true]);
+});
+
+test('stop while the initial chain check is pending cancels the start', async () => {
+  let release;
+  const h = harness('v3', 100, () => new Promise(resolve => { release = resolve; }));
+  const pending = h.call('mine-start', 'Example', 10000, 25);
+  await h.call('mine-stop');
+  release();await pending;
+  assert.equal(h.jobs.length, 0);
+  assert.equal(h.timers.length, 0);
+  assert.equal(h.call('mine-status').mining, false);
 });
 
 test('invalid intensity cannot start a job and old runtimes reject throttling explicitly', async () => {

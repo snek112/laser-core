@@ -208,12 +208,12 @@ test('regtest mines without network agreement and a matched tip needs no overrid
   assert.ok(matched.calls.some(c=>c[0]==='mineStart'));
 });
 
-test('a timed-out status call reads as a busy node, not an offline one',async()=>{
+test('a timed-out status call retains stale readings without claiming current reachability',async()=>{
   let answering=true;
   const h=await ready();
   const answer=h.laser.status;
   h.laser.status=async()=>{
-    if(!answering)throw new Error('The local node is listening on 127.0.0.1:19544 but did not answer within 3 s on 2 attempts.');
+    if(!answering)throw new Error('The local node at 127.0.0.1:19544 did not answer within 3 s on 2 attempts; status is unknown.');
     return answer();
   };
   h.laser.startup=async()=>({running:true,ready:true,rpc:{kind:answering?'ok':'busy'}});
@@ -223,15 +223,16 @@ test('a timed-out status call reads as a busy node, not an offline one',async()=
   assert.equal(h.app.state.node.waiting,true);
   assert.equal(h.app.state.node.online,true,'a busy node is never reported offline');
   const busy=h.app.renderVals();
-  assert.equal(busy.banner.label,'Node busy');
-  assert.equal(busy.sbar[0].text,'Node busy');
-  assert.equal(busy.net.kicker,'Busy');
+  assert.equal(busy.banner.label,'Awaiting node');
+  assert.equal(busy.sbar[0].text,'Awaiting node');
+  assert.equal(busy.net.kicker,'Waiting');
+  assert.doesNotMatch(busy.banner.text,/running and listening/);
   assert.equal(h.app.state.activity[0].kind,'warn');
-  assert.match(h.app.state.activity[0].text,/busy and did not answer in time/);
+  assert.match(h.app.state.activity[0].text,/did not answer in time; status is unknown/);
   assert.ok(!h.app.state.activity.some(a=>/Lost connection/.test(a.text)));
   // Readings stay, marked stale, instead of being cleared as unavailable.
   assert.equal(busy.bal.stale,true);
-  assert.match(busy.bal.availSub,/node busy/);
+  assert.match(busy.bal.availSub,/status delayed/);
   answering=true;await h.app.poll();
   assert.equal(h.app.state.node.waiting,false);
   assert.match(h.app.state.activity[0].text,/answering again/);

@@ -4,7 +4,7 @@ const path=require('node:path');
 const vm=require('node:vm');
 const {miningGate}=require('../mining-gate');
 const root=path.resolve(__dirname,'..');
-const TIP='ab'.repeat(32), DEFAULT_INTENSITY=25;
+const TIP='ab'.repeat(32), DEFAULT_INTENSITY=50;
 function setup(bridge={},stored={}) {
   const storage=new Map(Object.entries(stored));
   const calls=[];

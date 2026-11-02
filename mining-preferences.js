@@ -3,9 +3,11 @@ const fs = require('fs');
 const path = require('path');
 const { miningIntensity } = require('./ipc-validation');
 
-// Mining starts at a low intensity unless the operator has chosen otherwise,
-// so a first run does not commit the whole machine to it.
-const DEFAULT_MINING_INTENSITY = 25;
+// Mining starts below full intensity unless the operator has chosen otherwise,
+// so a first run does not commit the whole machine to it. Kept above the
+// researchPaused threshold so optional background research keeps running by
+// default.
+const DEFAULT_MINING_INTENSITY = 50;
 
 function loadMiningPreferences(file) {
   try {

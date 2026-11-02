@@ -121,7 +121,7 @@ test('intensity is saved and passed to continuous and one-shot mining',async()=>
 
 test('intensity changes report errors without saving an unapplied choice',async()=>{
   const h=await ready({mineSetIntensity:async()=>{throw new Error('Unavailable');}});
-  await h.app.setMiningIntensity('50');assert.equal(h.app.state.intensity,DEFAULT_INTENSITY);
+  await h.app.setMiningIntensity('25');assert.equal(h.app.state.intensity,DEFAULT_INTENSITY);
   assert.equal(h.app.state.intensityBusy,false);assert.equal(h.app.state.mineErr,'Unavailable');
   assert.equal(h.storage.has('laser-core.preferences.v1'),false);
   assert.equal(setup({}, {'laser-core.preferences.v1':'{"miningIntensity":0}'}).app.state.intensity,DEFAULT_INTENSITY);

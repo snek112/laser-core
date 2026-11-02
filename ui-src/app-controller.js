@@ -6,7 +6,7 @@ const FEES = [['0.05', 'Priority'], ['0.02', 'High'], ['0.01', 'Standard'], ['0.
 const SPECTRUM = ['#6a2cf0', '#2a5cf5', '#0a84c8', '#00897d', '#3f9a2e', '#c4237f'];
 
 const CKEY = 'laser-core.contacts.v1', PREFS_KEY = 'laser-core.preferences.v1';
-const INTENSITIES = [10, 25, 50, 75, 100], DEFAULT_INTENSITY = 25;
+const INTENSITIES = [10, 25, 50, 75, 100], DEFAULT_INTENSITY = 50;
 
 function parseLaser(v) {
   const s = String(v == null ? '' : v).trim();

@@ -7,7 +7,7 @@ test('intensity is recovered before startup and malformed settings do not become
  const folder=fs.mkdtempSync(path.join(os.tmpdir(),'laser-intensity-'));
  const file=path.join(folder,'mining-preferences.json');
  try {
-  assert.equal(researchPaused(DEFAULT_MINING_INTENSITY),true);
+  assert.equal(researchPaused(DEFAULT_MINING_INTENSITY),false,'the default keeps optional research running');
   assert.deepEqual(loadMiningPreferences(file),{intensity:DEFAULT_MINING_INTENSITY,saved:false});
   saveMiningPreferences(file,10);assert.deepEqual(loadMiningPreferences(file),{intensity:10,saved:true});
   assert.deepEqual(JSON.parse(fs.readFileSync(file)),{intensity:10});
